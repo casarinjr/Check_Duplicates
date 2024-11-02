@@ -4,8 +4,8 @@
 # Author: Amauri Casarin Junior
 # Purpose: Find and move (optionally) probable duplicate files based on their metadata
 # License: GPL-3.0 license
-# Version: 0.5
-# Date: November 1, 2024
+# Version: 0.6
+# Date: November 2, 2024
 
 usage_message="Usage: $0 [-sdhc] [-N|M|B|R] target_directory
 
@@ -18,9 +18,10 @@ Options:
 
         File operations (one):
         [-N] Files are not touched. (default)
-        [-M] Move all duplicates found into ./DUPLICATE subdirectory.
-        [-B] Move back files in ./DUPLICATE directory to its origin.
-        [-R] Remove extra duplicates found (keep 1 master copy).
+        [-M] Move all duplicates found into target/DUPLICATE subdirectory.
+        [-B] Move back files in target/DUPLICATE directory to its origin.
+        [-L] Link extra duplicates (replace files for hard links).
+        [-R] Remove extra duplicates found keeping just 1 master copy of each match.
 
         Combinations:
         Match operations can be combined, any combination is valid.
@@ -42,6 +43,7 @@ checksum_length=32
 DO_NOTHING=1
 MOVE_ALL=0
 MOVE_BACK=0
+LINK_EXTRAS=0
 REMOVE_EXTRAS=0
 operation_name=""
 #--------------------------------------------------------------------------------------
@@ -49,7 +51,7 @@ operation_name=""
 #INPUT CHECKS
 #--------------------------------------------------------------------------------------
 # Process options using getopts
-while getopts ":sdhcNMBR" opt; do
+while getopts ":sdhcNMBLR" opt; do
     case "$opt" in
         s) SIZE_MATCH=true; pattern_length=13;;
 
@@ -66,6 +68,8 @@ while getopts ":sdhcNMBR" opt; do
 
         B) MOVE_BACK=1; operation_name="move"; DO_NOTHING=0;;
 
+        L) LINK_EXTRAS=1; operation_name="link"; DO_NOTHING=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
+
         R) REMOVE_EXTRAS=1; operation_name="remove"; DO_NOTHING=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
 
         \?) echo -e "Invalid option: -$OPTARG"; echo "$usage_message"; exit 1;;
@@ -80,8 +84,8 @@ if [ "$#" -ne 1 ]; then
     echo "$usage_message"
     exit 1
 # Check conflicting file operations
-elif [ "$(( DO_NOTHING + MOVE_ALL + MOVE_BACK + REMOVE_EXTRAS ))" -gt 1 ]; then
-    echo "Error: Options N,M,B or R cannot be used together."
+elif [ "$(( DO_NOTHING + MOVE_ALL + MOVE_BACK + LINK_EXTRAS + REMOVE_EXTRAS ))" -gt 1 ]; then
+    echo "Error: File operations N, M, B, L or R cannot be used together."
     echo "$usage_message"
     exit 1
 elif [ -d "$1" ]; then
@@ -246,9 +250,22 @@ move_back () {
     echo "ok"
 }
 
+link_extras() {
+    confirm_action
+    echo -e "\nReplacing extra duplicates by links..."
+    while IFS=$'\t' read -r -a tabs; do
+        checksum="${tabs[0]}"
+        link_path="${tabs[-1]}"
+        master_path=$(echo "$MASTER_DUPLICATES" | grep -E "^($checksum)" | awk -F'\t' '{print $NF}')
+        ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
+        echo "Replaced "$link_path" by a link to "$master_path""
+    done <<< "$EXTRA_DUPLICATES"
+    echo "ok"
+}
+
 remove_extras() {
     confirm_action
-    echo -e "\nRemoving files..."
+    echo -e "\nRemoving extra duplicates..."
     while IFS=$'\t' read -r -a tabs; do
         path="${tabs[-1]}"
         rm "$path"
@@ -268,6 +285,9 @@ elif [ "$MOVE_ALL" = 1 ]; then
     find_duplicates
     move_all
     exit
+elif [ "$LINK_EXTRAS" = 1 ]; then
+    find_extras
+    link_extras
 elif [ "$REMOVE_EXTRAS" = 1 ]; then
     find_extras
     remove_extras
