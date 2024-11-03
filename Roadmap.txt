@@ -1,5 +1,4 @@
 Road map:
-v0.7 Add inode match operation and flexible headtail match.
-v0.8 Add reference directory as input option
-v0.9 Add verbose (all) and quiet (only final) results option
+v0.8 Add verbose (all), normal, and quiet (only final) output option, search depth and flexible headtail match.
+v0.9 Add reference directory as input option
 v1.0 Add Merge directories as file operation

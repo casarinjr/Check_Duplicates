@@ -1,20 +1,20 @@
 #!/bin/bash
-#set -x # to debug
 
 # Author: Amauri Casarin Junior
 # Purpose: Find and move (optionally) probable duplicate files based on their metadata
 # License: GPL-3.0 license
-# Version: 0.6
+# Version: 0.7
 # Date: November 2, 2024
 
-usage_message="Usage: $0 [-sdhc] [-N|M|B|R] target_directory
+usage_message="Usage: $0 [-isdhc] [-N|M|B|R] target_directory
 
 Options:
         Match operations (any):
+        [-i] Perform a metada match by inode (find hard links).
         [-s] Perform a metadata match by size in bytes. (default)
         [-d] Perform a metadata match by date (last modification time).
         [-h] Perform a data match by bytes in head and tail.
-        [-c] Perform a data match by md5 checksum.
+        [-c] Perform a data match by md5
 
         File operations (one):
         [-N] Files are not touched. (default)
@@ -27,35 +27,35 @@ Options:
         Match operations can be combined, any combination is valid.
         File operations cannot be combined, only one option is valid.
 
-Example: ./check_duplicates.sh -dcM ~/Documents_directory"
+Example: ./check_duplicates.sh -dcM ~/Documents"
 
 # INITIALIZATION
 #--------------------------------------------------------------------------------------
-# MATCH FLAGS, CONSTANTS, AND VARIABLES
+# MATCH FLAGS
 SIZE_MATCH=true
+INODE_MATCH=false
 DATE_MATCH=false
-pattern_length=13
 HEADTAIL_MATCH=false
 CHECKSUM_MATCH=false
-headtail_length=10
-checksum_length=32
-# FILE FLAGS, CONSTANTS, AND VARIABLES
+# FILE FLAGS AND VARIABLES
 DO_NOTHING=1
 MOVE_ALL=0
 MOVE_BACK=0
 LINK_EXTRAS=0
 REMOVE_EXTRAS=0
-operation_name=""
+
 #--------------------------------------------------------------------------------------
 
 #INPUT CHECKS
 #--------------------------------------------------------------------------------------
 # Process options using getopts
-while getopts ":sdhcNMBLR" opt; do
+while getopts ":sdihcNMBLR" opt; do
     case "$opt" in
-        s) SIZE_MATCH=true; pattern_length=13;;
+        s) SIZE_MATCH=true;;
 
-        d) DATE_MATCH=true; pattern_length=46;;
+        d) DATE_MATCH=true;;
+
+        i) INODE_MATCH=true;;
 
         h) HEADTAIL_MATCH=true; headtail_length=10;;
 
@@ -66,11 +66,12 @@ while getopts ":sdhcNMBLR" opt; do
 
         M) MOVE_ALL=1; operation_name="move"; DO_NOTHING=0;;
 
-        B) MOVE_BACK=1; operation_name="move"; DO_NOTHING=0;;
+        B) MOVE_BACK=1; operation_name="move back"; DO_NOTHING=0;;
 
         L) LINK_EXTRAS=1; operation_name="link"; DO_NOTHING=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
 
         R) REMOVE_EXTRAS=1; operation_name="remove"; DO_NOTHING=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
+
 
         \?) echo -e "Invalid option: -$OPTARG"; echo "$usage_message"; exit 1;;
     esac
@@ -102,76 +103,139 @@ fi
 
 # SEARCH FUNCTIONS
 #--------------------------------------------------------------------------------------
-find_duplicates(){
-    # METADATA MATCH
+find_all() {
     echo -n "Getting metadata... "
     # Find metadata for all files inside the directory
-    TARGET_FILES="$(find "$TARGET_DIR" -type f -printf "%13s\t%T+\t%p\n" | sort -n)"
-    META_DUPLICATES="$(uniq -D -w $pattern_length <<< "$TARGET_FILES")"
+    # fields: 1(size) 2(date) 3(headtail) 4(checksum) 5(inode) 6(path)
+    fields=6
+    TARGET_FILES="$(find "$TARGET_DIR" -type f -printf "%s\t%T+\t-\t-\t%i\t%p\n")"
+    total_target="$(echo "$TARGET_FILES" | grep -c -v '^$')"
+
     echo "ok"
-    # Update probable duplicates
-    PROBABLE_DUPLICATES=$META_DUPLICATES
-    total_duplicates="$(echo "$PROBABLE_DUPLICATES" | grep -c -v '^$')"
+}
+
+
+find_duplicates() {
+    DUPLICATES=$(awk -F'\t' -v cols="${match_columns[*]}" '
+    BEGIN {
+        split(cols, colsArr, " ")
+    }
+    { # process each column from the array received into a combined key
+        key = ""
+        for (i in colsArr) {
+            if (key != "")
+                key = key "\t"
+            key = key $colsArr[i]
+        }
+        count[key]++
+        if (lines[key])
+            lines[key] = lines[key] "\n" $0 # Append to existing entry
+        else
+            lines[key] = $0 # Initialize new entry
+    }
+    END {
+        for (key in count)
+            if (count[key] > 1) # Check for duplicates
+                print lines[key] # Print duplicate lines
+    }' <<< "$1" )
+    total_duplicates="$(echo "$DUPLICATES" | grep -c -v '^$')"
     if [ "$total_duplicates" = 0 ];then
-        echo "No duplicate files found."
+        echo "$total_target files assessed. No duplicate files found for your criteria."
         exit
+    else
+        TARGET_FILES=$DUPLICATES #update the tarfet with the duplicates for each match operation
+        echo -e "Step duplicate files: $total_duplicates"
+        #echo "$DUPLICATES"
     fi
-    echo -e "Metadata duplicate files:"
-    echo "$PROBABLE_DUPLICATES"
-    echo -e "Total found: $total_duplicates\n"
+}
+
+find_extras() {
+    MASTER_DUPLICATES=$(awk -F'\t' -v cols="${match_columns[*]}" '
+    BEGIN {
+        split(cols, colsArr, " ")
+    }
+    {
+        # process each column from the array received into a combined key
+        key = ""
+        for (i in colsArr) {
+            if (key != "")
+                key = key "\t"
+            key = key $colsArr[i]
+        }
+        if (!seen[key]++) { # finds masters (1 element of each key match)
+            print
+        }
+    }' <<< "$TARGET_FILES")
+    total_keep="$(echo "$MASTER_DUPLICATES" | grep -c -v '^$')"
+    EXTRA_DUPLICATES="$(echo "$DUPLICATES" | grep -v -x "$MASTER_DUPLICATES")"
+    total_remove="$(echo "$EXTRA_DUPLICATES" | grep -c -v '^$')"
+
+    echo -e "\nMaster duplicate files to be kept:"
+    echo "$MASTER_DUPLICATES"
+    echo -e "Total: $total_keep"
+    echo -e "\nExtra duplicate files to be removed:"
+    echo "$EXTRA_DUPLICATES"
+    echo -e "Total: $total_remove"
+}
+
+
+find_matches() {
+    # METADATA MATCH
+    match_columns=()
+    if [ "$SIZE_MATCH" = true ];then
+        match_columns+=("1")
+        find_duplicates "$TARGET_FILES"
+    fi
+
+    if [ "$DATE_MATCH" = true ];then
+        match_columns+=("2")
+        find_duplicates "$TARGET_FILES"
+    fi
+
+    if [ "$INODE_MATCH" = true ];then
+        match_columns+=("5")
+        find_duplicates "$TARGET_FILES"
+    fi
 
 
     # HEADTAIL-DATA MATCH
     if [ "$HEADTAIL_MATCH" = true ];then
+        match_columns+=("3")
+        target_update=''
         counter=0
-        while IFS=$'\t' read -r -a tabs; do
+        while IFS=$'\t' read -r size date headtail checksum inode path; do
             counter=$((counter + 1))
-            size="${tabs[-3]}"
-            date="${tabs[-2]}"
-            path="${tabs[-1]}"
             printf "\rGetting headtail-data... %d/%d " "$counter" "$total_duplicates"
             HEAD="$(head -c $headtail_length "$path" | xxd -p)"
             TAIL="$(tail -c $headtail_length "$path" | xxd -p)"
             headtail="${HEAD}${TAIL}"
-            headtails+="$headtail\t$size\t$date\t$path\n"
-        done <<< "$PROBABLE_DUPLICATES"
+            target_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$path\n" #update with the headtail data,change to printf
+        done <<< "$TARGET_FILES"
         echo -e "ok"
-        HEADTAIL_DUPLICATES="$(echo -e "$headtails" | sort -n | uniq -D -w $((4 * headtail_length)) | awk 'NF')"
-        PROBABLE_DUPLICATES=$HEADTAIL_DUPLICATES # Update probable duplicates
-        total_duplicates="$(echo "$PROBABLE_DUPLICATES" | grep -c -v '^$')"
-        if [ "$total_duplicates" = 0 ];then
-            echo "No duplicate files found."
-            exit
-        fi
-        echo -e "Headtail duplicate files:"
-        echo "$PROBABLE_DUPLICATES"
-        echo -e "Total found: $total_duplicates\n"
+        TARGET_FILES="$(echo -e "$target_update")"
+        find_duplicates "$TARGET_FILES" "${match_columns[*]}"
     fi
 
     # CHECKSUM-DATA MATCH
     if [ "$CHECKSUM_MATCH" = true ];then
+        match_columns+=("4")
+        target_update=''
         counter=0
-        while IFS=$'\t' read -r -a tabs; do
+        while IFS=$'\t' read -r size date headtail checksum inode path; do
             counter=$((counter + 1))
-            size="${tabs[-3]}"
-            date="${tabs[-2]}"
-            path="${tabs[-1]}"
             printf "\rGetting checksum data... %d/%d " "$counter" "$total_duplicates"
             checksum=$(md5sum "$path"| cut -f 1  -d " ")
-            checksums+="$checksum\t$size\t$date\t$path\n"
-        done <<< "$PROBABLE_DUPLICATES"
+            target_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$path\n" #update with the checksum data
+        done <<< "$TARGET_FILES"
         echo -e "ok"
-        CHECKSUM_DUPLICATES="$(echo -e "$checksums" | sort -n | uniq -D -w $checksum_length)"
-        PROBABLE_DUPLICATES=$CHECKSUM_DUPLICATES # Update probable duplicates
-        total_duplicates="$(echo "$PROBABLE_DUPLICATES" | grep -c -v '^$')"
-        if [ "$total_duplicates" = 0 ];then
-            echo "No duplicate files found."
-            exit
-        fi
-        echo -e "Checksum duplicate files:"
-        echo "$PROBABLE_DUPLICATES"
-        echo -e "Total found: $total_duplicates\n"
+        TARGET_FILES="$(echo -e "$target_update")"
+        find_duplicates "$TARGET_FILES" "${match_columns[*]}"
     fi
+
+
+    echo -e "\nDuplicate files found:"
+    echo "$DUPLICATES" | sort -n
+    echo -e "$total_target files assessed. $total_duplicates duplicates found."
 }
 
 find_moved() {
@@ -186,25 +250,9 @@ find_moved() {
 
     echo -e "Files found to be moved back:"
     echo "$MOVED_FILES"
-    echo -e "Total found: $total_found\n"
+    echo -e "Total: $total_found\n"
 }
 
-
-find_extras() {
-    find_duplicates
-    # Selecting master and extra files
-    MASTER_DUPLICATES="$(echo "$PROBABLE_DUPLICATES" | uniq -w $checksum_length)"
-    total_keep="$(echo "$MASTER_DUPLICATES" | grep -c -v '^$')"
-    EXTRA_DUPLICATES="$(echo "$PROBABLE_DUPLICATES" | grep -v -x "$MASTER_DUPLICATES")"
-    total_remove="$(echo "$EXTRA_DUPLICATES" | grep -c -v '^$')"
-
-    echo -e "Master duplicate files to be kept:"
-    echo "$MASTER_DUPLICATES"
-    echo -e "Total: $total_keep"
-    echo -e "\nExtra duplicate files to be removed:"
-    echo "$EXTRA_DUPLICATES"
-    echo -e "Total: $total_remove"
-}
 #--------------------------------------------------------------------------------------
 
 
@@ -221,7 +269,6 @@ confirm_action() {
 
 
 move_all() {
-    confirm_action
     counter=0
     echo -e "\nMoving duplicates..."
     mkdir -p "$DUPLICATES_DIR"  # Create directory if it doesn't exist
@@ -234,12 +281,11 @@ move_all() {
         new_filename="${formatted_counter} {:${relative_path//\//|}"  # Replace / with |
         mv "$path" "${DUPLICATES_DIR}/$new_filename"
         echo "Moved $path to $DUPLICATES_DIR"
-    done <<< "$PROBABLE_DUPLICATES"
+    done <<< "$TARGET_FILES"
     echo "ok"
 }
 
 move_back () {
-    confirm_action
     echo -e "\nMoving files back..."
     while IFS=$'\t' read -r currernt_path; do
         formatted_old_path="${currernt_path#*\{:}"  # Remove everything up to the first '{:'
@@ -251,7 +297,6 @@ move_back () {
 }
 
 link_extras() {
-    confirm_action
     echo -e "\nReplacing extra duplicates by links..."
     while IFS=$'\t' read -r -a tabs; do
         checksum="${tabs[0]}"
@@ -264,7 +309,6 @@ link_extras() {
 }
 
 remove_extras() {
-    confirm_action
     echo -e "\nRemoving extra duplicates..."
     while IFS=$'\t' read -r -a tabs; do
         path="${tabs[-1]}"
@@ -279,21 +323,32 @@ remove_extras() {
 # OPERATION:
 #--------------------------------------------------------------------------------------
 if [ "$DO_NOTHING" = 1 ]; then
-    find_duplicates
+    find_all
+    find_matches
     exit
 elif [ "$MOVE_ALL" = 1 ]; then
-    find_duplicates
+    find_all
+    find_matches
+    confirm_action
     move_all
     exit
 elif [ "$LINK_EXTRAS" = 1 ]; then
+    find_all
+    find_matches
     find_extras
+    confirm_action
     link_extras
+    exit
 elif [ "$REMOVE_EXTRAS" = 1 ]; then
+    find_all
+    find_matches
     find_extras
+    confirm_action
     remove_extras
     exit
 elif [ "$MOVE_BACK" = 1 ]; then
     find_moved
+    confirm_action
     move_back
     exit
 fi
