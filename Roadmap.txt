@@ -1,4 +1,3 @@
 Road map:
-v0.8 Add verbose (all), normal, and quiet (only final) output option, search depth and flexible headtail match.
-v0.9 Add reference directory as input option
-v1.0 Add Merge directories as file operation
+v0.9 Add reference directory as input option, add symbolic links operation.
+v1.0 Add Merge directories as file operation.
