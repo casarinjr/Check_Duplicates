@@ -1,3 +1,2 @@
 Road map:
-v0.9 Add reference directory as input option, add symbolic links operation.
-v1.0 Add Merge directories as file operation.
+v1.0 Add Merge directories as file operation (copy non duplicates from reference directory).
