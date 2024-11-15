@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # Author: Amauri Casarin Junior
-# Purpose: Find and move (optionally) probable duplicate files based on their metadata
+# Purpose: Batch search and processing duplicate files.
 # License: GPL-3.0 license
-# Version: 0.9
-# Date: November 12, 2024
+# Version: 1.0
+# Date: November 14, 2024
 
 usage_message="Usage: $0 [-options] target_directory
 
 Options:
         Search operations (one):
         [-r] Recursive search in target directory and all its subdirectories. (default)
-        [-d:] Maximum depth of search. Requires any number ≥ 1.
+        [-d:] Maximum depth of search. Requires any integer ≥ 1.
 
         Match operations (any):
         [-i] Perform a metadata match by inode (find hard links).
@@ -28,11 +28,12 @@ Options:
         [-B] Move back files in target/DUPLICATES directory to its origin.
         [-H] Hard link extra duplicates (replace duplicate files by hard links, saving disk space).
         [-R] Remove extra duplicates found, keeping just 1 master copy of each match.
+        [-C:] Copy unique (non duplicate) files from a reference directory.
 
         Output verbosity:
-        [-q] Quiet: only status and operational messages are echoed in the terminal. (0 precedence)
-        [-m] Moderate: final results are echoed additionally. (1 precedence) (default)
-        [-v] Verbose: partial results (of each matching process) are echoed additionally. (2 precedence)
+        [-q] Quiet: echo only status and operational messages. (0 precedence)
+        [-m] Moderate: echo final results additionally. (1 precedence) (default)
+        [-v] Verbose: echo partial results additionally and creates a log file. (2 precedence)
 
 
         Combinations:
@@ -62,6 +63,7 @@ MOVE_ALL=0
 MOVE_BACK=0
 HARDLINK_EXTRAS=0
 REMOVE_EXTRAS=0
+COPY_UNIQUES=0
 # OUTPUT VARIABLES
 verbosity=1 # 0 quiet, 1 normal and 2 verbose.
 #--------------------------------------------------------------------------------------
@@ -69,11 +71,18 @@ verbosity=1 # 0 quiet, 1 normal and 2 verbose.
 #INPUT CHECKS
 #--------------------------------------------------------------------------------------
 # Process options using getopts
-while getopts ":rd:qmvnstihcLSMBHR" opt; do
+while getopts ":rd:qmvnstihcLSMBHRC:" opt; do
     case "$opt" in
         r) RECURSIVE_SEARCH=1;;
 
-        d) DEPTH_SEARCH=1; max_depth=${OPTARG}; RECURSIVE_SEARCH=0;;
+        d) DEPTH_SEARCH=1; RECURSIVE_SEARCH=0;
+            if [[ "$OPTARG" =~ ^[0-9]+$ ]] && [ "$OPTARG" -ge 1 ]; then
+                max_depth=${OPTARG}
+                echo "Search files up to $max_depth level deep."
+            else
+                echo "Error: $OPTARG is not a valid integer argument for option -d (>= 1)"
+                exit 1
+            fi;;
 
         q) verbosity=0;;
 
@@ -107,6 +116,15 @@ while getopts ":rd:qmvnstihcLSMBHR" opt; do
 
         R) REMOVE_EXTRAS=1; operation_name="remove"; LIST_ALL=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
 
+        C) COPY_UNIQUES=1; operation_name="copy"; LIST_ALL=0; CHECKSUM_MATCH=true;
+            if [[ -d "$OPTARG" ]]; then
+                REFERENCE_DIR="$OPTARG"
+                echo "Reference directory provided: $REFERENCE_DIR"
+            else
+                echo "Error: $OPTARG is not a valid directory"
+                exit 1
+            fi;;
+
 
         \?) echo -e "Invalid option: -$OPTARG"; echo "$usage_message"; exit 1;;
 
@@ -128,8 +146,8 @@ elif [ "$(( RECURSIVE_SEARCH + DEPTH_SEARCH ))" -gt 1 ]; then
     echo "$usage_message"
     exit 1
 # Check conflicting file operations
-elif [ "$(( LIST_ALL + SOFTLINK_ALL+ MOVE_ALL + MOVE_BACK + HARDLINK_EXTRAS + REMOVE_EXTRAS ))" -gt 1 ]; then
-    echo "Error: File operations L, S, M, B, H or R cannot be used together."
+elif [ "$(( LIST_ALL + SOFTLINK_ALL+ MOVE_ALL + MOVE_BACK + HARDLINK_EXTRAS + REMOVE_EXTRAS + COPY_UNIQUES))" -gt 1 ]; then
+    echo "Error: File operations L, S, M, B, H, R or C cannot be used together."
     echo "$usage_message"
     exit 1
 elif [ -d "$1" ]; then
@@ -137,12 +155,25 @@ elif [ -d "$1" ]; then
     # Set inner directory for duplicate files or links
     DUPLICATES_DIR="$TARGET_DIR/DUPLICATES"
     LINKS_DIR="$TARGET_DIR/LINKS_TO_DUPLICATES"
+    echo "Target directory provided: $TARGET_DIR"
 else
-    echo "Error: Invalid target directory"
+    echo "Error: Invalid target directory: $1"
     echo "$usage_message"
     exit 1
 fi
 #--------------------------------------------------------------------------------------
+
+
+# LOGS
+#--------------------------------------------------------------------------------------
+# Log file for verbosity = 3
+if [ "$verbosity" = 2 ]; then
+    # Get the current timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+
+    # Redirecting output to the log file
+    exec > >(tee -a "$TARGET_DIR/CD_log_${timestamp}.log") 2>&1
+fi
 
 # Function to handle verbosity
 log() {
@@ -165,6 +196,7 @@ log() {
         echo "$echo_option" "$message"
     fi
 }
+#--------------------------------------------------------------------------------------
 
 # SEARCH FUNCTIONS
 #--------------------------------------------------------------------------------------
@@ -189,21 +221,55 @@ done
 header="$(echo -e "$header")"
 
 search_files() {
-    log status -n "Searching files... "
+    local directory=$1
+
+    log status -n "Searching files in $directory... "
     # Find metadata for all files inside the directory
     print_format="%s\t%T+\t-\t-\t%i\t%f\t%p\n" # "-" for reserved non metadata fields
     if [ "$DEPTH_SEARCH" = 1 ]; then
-        TARGET_FILES="$(find "$TARGET_DIR" -maxdepth "$max_depth" -type f -size +0c -printf "$print_format")"
+        ASSESSED_FILES="$(find "$directory" -maxdepth "$max_depth" -type f -size +0c -printf "$print_format")"
     else
-        TARGET_FILES="$(find "$TARGET_DIR" -type f -size +0c -printf "$print_format")"
+        ASSESSED_FILES="$(find "$directory" -type f -size +0c -printf "$print_format")"
     fi
-    total_target="$(echo "$TARGET_FILES" | grep -c -v '^$')"
+    total_assessed="$(echo "$ASSESSED_FILES" | grep -c -v '^$')"
     log status "ok"
-    log status -e "Found files in $TARGET_DIR: $total_target\n"
+    log status -e "Files found: $total_assessed\n"
+
+
+}
+
+search2d_files() {
+    TARGET_DIR=$1
+    REFERENCE_DIR=$2
+
+    search_files "$TARGET_DIR"
+    TARGET_FILES=$ASSESSED_FILES
+    search_files "$REFERENCE_DIR"
+    REFERENCE_FILES=$ASSESSED_FILES
+
+    if [ "$total_assessed" = 0 ];then
+        log status "No files found in reference directory $directory."
+        exit
+    else
+        # Merge REFERENCE_FILES and TARGET_FILES to process duplicates
+        MERGED_FILES="$(echo -e "$TARGET_FILES\n$REFERENCE_FILES" | sort -n)"
+    fi
 }
 
 
-find_duplicates() {
+search_moved() {
+    # Find metadata for all files inside the DUPLICATE directory
+    local directory=$1
+    MOVED_FILES="$(find "$directory" -type f -printf "%p\n" | sort -n)"
+    total_found="$(echo "$MOVED_FILES" | grep -c -v '^$')"
+
+    if [ "$total_found" = 0 ];then
+        log status "No files found in $directory."
+        exit
+    fi
+}
+
+get_duplicates() {
     match_name="$2"
     log status -E "Matching for $match_name..."
     DUPLICATES=$(awk -F'\t' -v cols="${match_columns[*]}" '
@@ -233,15 +299,16 @@ find_duplicates() {
         log status -e "No duplicate files found for your criteria."
         exit
     else
-        TARGET_FILES=$DUPLICATES #update the target with the duplicates for each match operation
         log partial -E "$DUPLICATES" | sort -n
         log status -E "Found $match_name-duplicates: $total_duplicates"
         log partial ""
     fi
 }
 
-find_extras() {
-    MASTER_DUPLICATES=$(awk -F'\t' -v cols="${match_columns[*]}" '
+get_uniques() {
+    match_name="$2"
+    log status -E "Filtering unique $match_name elements..."
+    UNIQUES=$(awk -F'\t' -v cols="${match_columns[*]}" '
     BEGIN {
         split(cols, colsArr, " ")
     }
@@ -256,41 +323,46 @@ find_extras() {
         if (!seen[key]++) { # finds masters (1 element of each key match)
             print
         }
-    }' <<< "$TARGET_FILES")
-    EXTRA_DUPLICATES="$(echo "$DUPLICATES" | grep -v -x "$MASTER_DUPLICATES")"
+    }' <<< "$1")
 }
 
 
 find_matches() {
     # METADATA MATCH
+    ASSESSED_FILES=$1
     match_columns=()
+
+    match_name="Inode"
+    match_columns=(${columns_index[$match_name]})
     if [ "$INODE_MATCH" = true ];then
-        match_name="Inode"
-        match_columns+=(${columns_index[$match_name]})
-        find_duplicates "$TARGET_FILES" "$match_name"
-    else
-        # Discard hard links (keep just one file per inode)
-        log status -E "Getting unique inodes"
-        DUPLICATES="$(awk -F'\t' '!seen[$5]++' <<< "$TARGET_FILES")"
-        TARGET_FILES=$DUPLICATES #update the target
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        return # no need for any other check if inode_match
+    else # Discard hard links (keep just one file per inode)
+        get_uniques "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$UNIQUES # update
+
     fi
+    match_columns=() # restart with empity match_columns after assessing inodes
 
     if [ "$NAME_MATCH" = true ];then
         match_name="Name"
         match_columns+=(${columns_index[$match_name]})
-        find_duplicates "$TARGET_FILES" "$match_name"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
     fi
 
     if [ "$SIZE_MATCH" = true ];then
         match_name="Size"
         match_columns+=(${columns_index[$match_name]})
-        find_duplicates "$TARGET_FILES" "$match_name"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
     fi
 
     if [ "$TIME_MATCH" = true ];then
         match_name="Time"
         match_columns+=(${columns_index[$match_name]})
-        find_duplicates "$TARGET_FILES" "$match_name"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
     fi
 
 
@@ -299,7 +371,7 @@ find_matches() {
         match_name="Headtail"
         match_columns+=(${columns_index[$match_name]})
 
-        target_update=''
+        local data_update=''
         counter=0
         while IFS=$'\t' read -r size date headtail checksum inode name path; do
             counter=$((counter + 1))
@@ -307,11 +379,12 @@ find_matches() {
             HEAD="$(head -c $headtail_length "$path" | xxd -p)"
             TAIL="$(tail -c $headtail_length "$path" | xxd -p)"
             headtail="${HEAD}${TAIL}"
-            target_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the headtail data,change to printf
-        done <<< "$TARGET_FILES"
+            data_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the headtail data
+        done <<< "$ASSESSED_FILES"
         echo -e "ok"
-        TARGET_FILES="$(echo -e "$target_update")"
-        find_duplicates "$TARGET_FILES" "$match_name"
+        ASSESSED_FILES="$(echo -e "$data_update")"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
     fi
 
     # CHECKSUM-DATA MATCH
@@ -319,29 +392,45 @@ find_matches() {
         match_name="Checksum"
         match_columns+=(${columns_index[$match_name]})
 
-        target_update=''
+        data_update=''
         counter=0
         while IFS=$'\t' read -r size date headtail checksum inode name path; do
             counter=$((counter + 1))
             printf "\rGetting checksum data... %d/%d " "$counter" "$total_duplicates"
             checksum=$(md5sum "$path"| cut -f 1  -d " ")
-            target_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the checksum data
-        done <<< "$TARGET_FILES"
+            data_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the checksum data
+        done <<< "$ASSESSED_FILES"
         echo -e "ok"
-        TARGET_FILES="$(echo -e "$target_update")"
-        find_duplicates "$TARGET_FILES" "$match_name"
+        ASSESSED_FILES="$(echo -e "$data_update")"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
     fi
+    DUPLICATES=$ASSESSED_FILES
 }
 
-search_moved() {
-    # Find metadata for all files inside the DUPLICATE directory
-    MOVED_FILES="$(find "$DUPLICATES_DIR" -type f -printf "%p\n" | sort -n)"
-    total_found="$(echo "$MOVED_FILES" | grep -c -v '^$')"
+find_extras() {
+    DUPLICATES=$1
+    get_uniques "$DUPLICATES"
+    MASTER_DUPLICATES="$UNIQUES"
+    EXTRA_DUPLICATES="$(echo "$DUPLICATES" | grep -v -x "$MASTER_DUPLICATES")"
+}
 
-    if [ "$total_found" = 0 ];then
-        log status "No files found in $DUPLICATES_DIR."
-        exit
-    fi
+find2d_uniques() {
+    MERGED_FILES=$1
+    find_matches "$MERGED_FILES"
+    MERGED_DUPLICATES=$DUPLICATES
+    REFERENCE_FILES_path=$(awk -F'\t' '{print $NF}' <<< "$REFERENCE_FILES")
+
+    # Split the duplicates
+    REFERENCE_DUPLICATES=$(grep "$REFERENCE_FILES_path"  <<< "$MERGED_DUPLICATES")
+    TARGET_DUPLICATES=$(grep -v -x "$REFERENCE_DUPLICATES" <<< "$MERGED_DUPLICATES")
+    # remerger but with the target on top so it takes precedence in the get_uniques function
+    remerged_duplicates="$(echo -e "$TARGET_FILES\n$REFERENCE_FILES")"
+    get_uniques "$remerged_duplicates"
+    MASTER_DUPLICATES=$UNIQUES
+    REFERENCE_EXTRAS=$(grep -v -x "$MASTER_DUPLICATES" <<< "$REFERENCE_DUPLICATES") # files not to be copied
+    REFERENCE_EXTRAS_path=$(awk -F'\t' '{print $NF}' <<< "$REFERENCE_EXTRAS")
+    REFERENCE_UNIQUES_path=$(grep -v -x "$REFERENCE_EXTRAS_path" <<< "$REFERENCE_FILES_path") # files to be copied
 }
 
 #--------------------------------------------------------------------------------------
@@ -350,6 +439,7 @@ search_moved() {
 # FILE OPERATION FUNCTIONS
 #--------------------------------------------------------------------------------------
 confirm_action() {
+    operation_name=$1
     echo ""
     read -p "Are you sure you want to $operation_name those files? [yes/no]: " response
     case "$response" in
@@ -361,23 +451,24 @@ confirm_action() {
 
 
 list_all() {
-    DUPLICATES="$(echo "$DUPLICATES" | sort -n)"
+    DUPLICATES="$(echo "$1" | sort -n)"
     log status -e "\nResults:"
     log final -E "$DUPLICATES"
-    log status -e "$total_target files assessed. $total_duplicates duplicates found."
+    log status -e "$total_assessed files assessed. $total_duplicates duplicates found."
 
-    duplicates_file="$TARGET_DIR/CDreport_duplicates.txt"
-    echo "$header" > $duplicates_file
-    echo "$DUPLICATES" >> $duplicates_file
-    log status -e "\nDuplicates report saved to $duplicates_file"
+    duplicates_report="$TARGET_DIR/CDreport_duplicates.txt"
+    echo "$header" > "$duplicates_report"
+    echo "$DUPLICATES" >> "$duplicates_report"
+    log status -e "\nDuplicate files report saved to $duplicates_report"
 }
 
 softlink_all() {
+    DUPLICATES=$1
     counter=0
     mkdir -p "$LINKS_DIR"  # Create directory if it doesn't exist
     log status -en "\nCreating soft links of duplicates..."
     softlinked_files="$TARGET_DIR/CDreport_softlinked_files.txt"
-    echo -n "" > $softlinked_files
+    echo -n "" > "$softlinked_files"
     while IFS=$'\t' read -r -a tabs; do
         counter=$((counter + 1))
         formatted_counter=$(printf "%0${#total_duplicates}d" "$counter") # counter with leading zeros
@@ -387,19 +478,20 @@ softlink_all() {
         ln -s "$duplicate_path" "$link_path"
         report_line="Created a soft link at $link_path pointing to $duplicate_path"
         log partial "$report_line"
-        echo "$report_line" >> $softlinked_files
-    done <<< "$TARGET_FILES"
+        echo "$report_line" >> "$softlinked_files"
+    done <<< "$DUPLICATES"
     log status "ok"
     log status -e "\nSoft linked files report saved to $softlinked_files"
 }
 
 
 move_all() {
+    DUPLICATES=$1
     counter=0
     mkdir -p "$DUPLICATES_DIR"  # Create directory if it doesn't exist
     log status -en "\nMoving duplicates..."
     moved_files="$TARGET_DIR/CDreport_moved_files.txt"
-    echo -n "" > $moved_files
+    echo -n "" > "$moved_files"
     while IFS=$'\t' read -r -a tabs; do
         counter=$((counter + 1))
         formatted_counter=$(printf "%0${#total_duplicates}d" "$counter") # counter with leading zeros
@@ -409,39 +501,100 @@ move_all() {
         mv "$path" "${DUPLICATES_DIR}/$new_filename"
         report_line="Moved $path to $DUPLICATES_DIR"
         log partial "$report_line"
-        echo "$report_line" >> $moved_files
-    done <<< "$TARGET_FILES"
+        echo "$report_line" >> "$moved_files"
+    done <<< "$DUPLICATES"
     log status "ok"
     log status -e "\nMoved files report saved to $moved_files"
 }
 
+list_copies() {
+    REFERENCE_UNIQUES_path=$1
+    REFERENCE_EXTRAS_path=$2
+    total_copy="$(echo "$REFERENCE_UNIQUES_path" | grep -c -v '^$')"
+    total_leave="$(echo "$REFERENCE_EXTRAS_path" | grep -c -v '^$')"
+
+    log status -e "Duplicate files from reference not to be copied:"
+    log final -E "$REFERENCE_EXTRAS_path"
+    log status -e "Total: $total_leave\n"
+
+    log status -e "\nUnique files from reference to be copied:"
+    log final -E "$REFERENCE_UNIQUES_path"
+    log status -e "Total: $total_copy\n"
+
+    duplicates_report="$TARGET_DIR/CDreport_duplicates.txt"
+    echo "$header" > "$duplicates_report"
+    echo "$DUPLICATES" >> "$duplicates_report"
+    log status -e "\nDuplicate files report saved to $duplicates_report"
+
+
+    if [ "$total_copy" = 0 ];then
+        log status -e "No unique files found to be copied."
+        exit
+    else
+        copy_report="$TARGET_DIR/CDreport_copy.txt"
+        echo "$REFERENCE_UNIQUES_path" > "$copy_report"
+        log status -e "\nUnique files report saved to $copy_report"
+    fi
+
+}
+
+copy_uniques() {
+    REFERENCE_UNIQUES_path=$1
+    log status -en "\nCoping files..."
+    copied_report="$TARGET_DIR/CDreport_copied_files.txt"
+    noncopied_report="$TARGET_DIR/CDreport_noncopied_files.txt"
+    echo -n "" > "$copied_report"
+    echo -n "$REFERENCE_EXTRAS_path" > "$noncopied_report"
+    while read -r path; do
+        relative_path=$(realpath --relative-to="$REFERENCE_DIR" "$path")
+        new_path="${TARGET_DIR}/$relative_path"
+        dir_path="$(dirname "$new_path")"
+        echo "$dir_path"
+        mkdir -p "$dir_path"
+        cp --update=none "$path" "$new_path" || cp "$path" "$dir_path/$(basename "${path%.*}")_$(date +%s).${path##*.}"
+
+        report_line="Copied $path to $new_path"
+        log partial "$report_line"
+        echo "$report_line" >> "$copied_report"
+    done <<< "$REFERENCE_UNIQUES_path"
+    log status -E "ok"
+    log status -e "\nCopied files report saved to $copied_report"
+    log status -e "\nNoncopied files report saved to $noncopied_report"
+}
+
+
+
 list_moved() {
+    MOVED_FILES=$1
     log status -e "Files found to be moved back:"
     log final -E "$MOVED_FILES"
     log status -e "Total: $total_found\n"
 
     moved_found="$TARGET_DIR/CDreport_moved_found.txt"
-    echo "$MOVED_FILES" > $moved_found
-    log status -e "\nMoved files found report saved to $moved_found"
+    echo "$MOVED_FILES" > "$moved_found"
+    log status -e "\nMoved-found report saved to $moved_found"
 }
 
 move_back () {
+    MOVED_FILES=$1
     log status -en "\nMoving files back..."
     movedback_files="$TARGET_DIR/CDreport_movedback_files.txt"
-    echo -n "" > $movedback_files
+    echo -n "" > "$movedback_files"
     while read -r currernt_path; do
         formatted_old_path="${currernt_path#*\{:}"  # Remove everything up to the first '{:'
         old_path="${TARGET_DIR}/${formatted_old_path//\|//}"  # Replace back all '|' with '/'
         mv "$currernt_path" "$old_path"
         report_line="Moved back to $old_path"
         log partial "$report_line"
-        echo "$report_line" >> $movedback_files
+        echo "$report_line" >> "$movedback_files"
     done <<< "$MOVED_FILES"
     log status -E "ok"
     log status -e "\nMoved back files report saved to $movedback_files"
 }
 
 list_extras() {
+    MASTER_DUPLICATES=$1
+    EXTRA_DUPLICATES=$2
     total_keep="$(echo "$MASTER_DUPLICATES" | grep -c -v '^$')"
     total_remove="$(echo "$EXTRA_DUPLICATES" | grep -c -v '^$')"
 
@@ -455,18 +608,19 @@ list_extras() {
 
     master_duplicates_file="$TARGET_DIR/CDreport_master_duplicates.txt"
     extra_duplicates_file="$TARGET_DIR/CDreport_extra_duplicates.txt"
-    echo "$header" > $master_duplicates_file
-    echo "$header" > $extra_duplicates_file
-    echo "$MASTER_DUPLICATES" >> $master_duplicates_file
-    echo "$EXTRA_DUPLICATES" >> $extra_duplicates_file
+    echo "$header" > "$master_duplicates_file"
+    echo "$header" > "$extra_duplicates_file"
+    echo "$MASTER_DUPLICATES" >> "$master_duplicates_file"
+    echo "$EXTRA_DUPLICATES" >> "$extra_duplicates_file"
     log status -e "\nMaster duplicates report saved to $master_duplicates_file"
     log status -e "Extra duplicates report saved to $extra_duplicates_file"
 }
 
 hardlink_extras() {
+    EXTRA_DUPLICATES=$1
     log status  -en "\nReplacing extra duplicates by hard links..."
     hardlinked_files="$TARGET_DIR/CDreport_hardlinked_files.txt"
-    echo -n "" > $hardlinked_files
+    echo -n "" > "$hardlinked_files"
     while IFS=$'\t' read -r -a tabs; do
         checksum="${tabs[${tabs_index["Checksum"]}]}"
         link_path="${tabs[${tabs_index["Path"]}]}"
@@ -474,22 +628,23 @@ hardlink_extras() {
         ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
         report_line="Replaced $link_path by a link to $master_path"
         log partial "$report_line"
-        echo "$report_line" >> $hardlinked_files
+        echo "$report_line" >> "$hardlinked_files"
     done <<< "$EXTRA_DUPLICATES"
     log status "ok"
     log status -e "\nHard linked files report saved to $hardlinked_files"
 }
 
 remove_extras() {
+    EXTRA_DUPLICATES=$1
     log status  -e "\nRemoving extra duplicates..."
     removed_files="$TARGET_DIR/CDreport_removed_files.txt"
-    echo -n "" > $removed_files
+    echo -n "" > "$removed_files"
     while IFS=$'\t' read -r -a tabs; do
         path="${tabs[${tabs_index["Path"]}]}"
         rm "$path"
         report_line="Removed $path"
         log partial "$report_line"
-        echo "$report_line" >> $removed_files
+        echo "$report_line" >> "$removed_files"
     done <<< "$EXTRA_DUPLICATES"
     log status "ok"
     log status -e "\nRemoved files report saved to $removed_files"
@@ -500,44 +655,51 @@ remove_extras() {
 # OPERATION:
 #--------------------------------------------------------------------------------------
 if [ "$LIST_ALL" = 1 ]; then
-    search_files
-    find_matches
-    list_all
+    search_files "$TARGET_DIR"
+    find_matches "$ASSESSED_FILES"
+    list_all "$DUPLICATES"
     exit
 elif [ "$SOFTLINK_ALL" = 1 ]; then
-    search_files
-    find_matches
-    list_all
-    softlink_all
+    search_files "$TARGET_DIR"
+    find_matches "$ASSESSED_FILES"
+    list_all "$DUPLICATES"
+    softlink_all "$DUPLICATES"
     exit
 elif [ "$MOVE_ALL" = 1 ]; then
-    search_files
-    find_matches
-    list_all
-    confirm_action
-    move_all
+    search_files "$TARGET_DIR"
+    find_matches "$ASSESSED_FILES"
+    list_all "$DUPLICATES"
+    confirm_action "$operation_name"
+    move_all "$DUPLICATES"
     exit
 elif [ "$HARDLINK_EXTRAS" = 1 ]; then
-    search_files
-    find_matches
-    find_extras
-    list_extras
-    confirm_action
-    hardlink_extras
+    search_files "$TARGET_DIR"
+    find_matches "$ASSESSED_FILES"
+    find_extras "$DUPLICATES"
+    list_extras "$MASTER_DUPLICATES" "$EXTRA_DUPLICATES"
+    confirm_action "$operation_name"
+    hardlink_extras "$EXTRA_DUPLICATES"
     exit
 elif [ "$REMOVE_EXTRAS" = 1 ]; then
-    search_files
-    find_matches
-    find_extras
-    list_extras
-    confirm_action
-    remove_extras
+    search_files "$TARGET_DIR"
+    find_matches "$ASSESSED_FILES"
+    find_extras "$DUPLICATES"
+    list_extras "$MASTER_DUPLICATES" "$EXTRA_DUPLICATES"
+    confirm_action "$operation_name"
+    remove_extras "$EXTRA_DUPLICATES"
     exit
 elif [ "$MOVE_BACK" = 1 ]; then
-    search_moved
-    list_moved
-    confirm_action
-    move_back
+    search_moved "$DUPLICATES_DIR"
+    list_moved "$MOVED_FILES"
+    confirm_action "$operation_name"
+    move_back "$MOVED_FILES"
+    exit
+elif [ "$COPY_UNIQUES" = 1 ]; then
+    search2d_files "$TARGET_DIR" "$REFERENCE_DIR"
+    find2d_uniques "$MERGED_FILES"
+    list_copies "$REFERENCE_UNIQUES_path" "$REFERENCE_EXTRAS_path"
+    confirm_action "$operation_name"
+    copy_uniques "$REFERENCE_UNIQUES_path"
     exit
 fi
 #--------------------------------------------------------------------------------------

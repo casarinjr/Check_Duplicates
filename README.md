@@ -24,7 +24,7 @@ To run the script, use the following command format:
 ### Options:
 	Search operations (one):
        [-r] Recursive search in target directory and all its subdirectories. (default)
-       [-d:] Maximum depth of search. Requires any number ≥ 1.
+       [-d:] Maximum depth of search. Requires any integer ≥ 1.
 
 	Match operations (any):
        [-i] Perform a metadata match by inode (find hard links).
@@ -41,11 +41,12 @@ To run the script, use the following command format:
        [-B] Move back files in target/DUPLICATES directory to its origin.
        [-H] Hard link extra duplicates (replace duplicate files by hard links, saving disk space).
        [-R] Remove extra duplicates found, keeping just 1 master copy of each match.
+       [-C:] Copy unique (non duplicate) files from a reference directory.
 
 	Output verbosity:
-       [-q] Quiet: only status and operational messages are echoed in the terminal. (0 precedence)
-       [-m] Moderate: final results are echoed additionally. (1 precedence) (default)
-       [-v] Verbose: partial results (of each matching process) are echoed additionally. (2 precedence)
+       [-q] Quiet: echo only status and operational messages. (0 precedence)
+       [-m] Moderate: echo final results additionally. (1 precedence) (default)
+       [-v] Verbose: echo partial results additionally and creates a log file. (2 precedence)
 
 Combining options:
  - Search operations cannot be combined, only one option is valid.
@@ -78,10 +79,13 @@ Combining options:
 ```bash
 ./check_duplicates.sh -vtR ~/Pictures/DUPLICATES
 ```
-
+7. Copying no duplicate files from reference directory (/DCIM) into target directory (/My Pictures).
+```bash
+./check_duplicates.sh -hc -C /home/USER/MEDIA/DCIM  "/home/USER/My Pictures"
+```
 ### Expected behavior and performance:
 
- 1. **Maximum search depth** *-d number* takes a numeric argument. It specifies how deep the find operation will look for files in a directory. It is most useful when you are performing this command in a higher hierarchy directory and do not want to assess all its subdirectories. Hence, *-d 1* will search only the target directory, and *-d 2* will search level 1 and 2 of subdirectories. If *-d#* is not specified, a **Recursive search** *-r* will be performed in all target files and subdirectories.
+ 1. **Maximum search depth** *-d #* takes a integer number as argument #. It specifies how deep the find operation will look for files in a directory. It is most useful when you are performing this command in a higher hierarchy directory and do not want to assess all its subdirectories. Hence, *-d 1* will search only the target directory, and *-d 2* will search level 1 and 2 of subdirectories. If *-d#* is not specified, a **Recursive search** *-r* will be performed in all target files and subdirectories.
  2. **Size-match** is always performed, you don't really need to specify *-s* to perform it. It will always be the first thing done. This is the core principle for a speedy performance. No files can be exactly equal if they have different sizes, so there is no point on wasting resources processing a full data check when we can discard a match by a simple metadata check.
  3. **Time-match** *-t* also speeds things a lot. However, it is optional because in some cases, when files were opened and saved without modification or the modification was manually reverted, it would discard matches by presenting different metadata (last modified time) even with the same content (the actual data).
  4. **Name-match** *-n* is pretty fast. Logically, it will not consider files that do not have the exact name match.
@@ -91,8 +95,9 @@ Combining options:
  8. **Softlink-all** *-S* operation will create symbolic links at target/LINKS_TO_DUPLICATES directory for all duplicate files found. It is useful for manual assessing duplicate files in an ordered way without changing its original name or location.
  9. **Move-all** *-M* operation will rename files when moving them to the DUPLICATES directory to avoid rewriting over files from different origin subdirectories that would have the same name in the destiny directory. You SHOULD NOT simply delete all files moved to that folder, since then you would have no other copies left. That operation is designed for manual check and deletion, thus you should probably want to keep at least one copy of each duplicate pair or group found. The files are renamed with its previous path so you know where they came from. This way, they will not be renamed/moved if their file path is longer than the maximum length allowed by your file system (typically 255 characters). You should not use this command multiple times in the same target directory, otherwise the renaming operation will build up for as many times as the operation is called.
  10. **Move-back** *-B* operation will only work after a **Move-all** *-M* operation and if you do not rename the /DUPLICATES directory or the files inside it. It will move back the files you decided to keep to its previous location. So you should not rename them if you want the Move-back operation to be able to find that previous location, which is stored in the file names.
- 11. **Hardlink-extras** *-H* will only be performed with a **checksum-match,** no matter if the user did not explicitly specify *-c*. This behavior is arbitrary set to prevent unwanted data loss, since checksum-match is currently the most reliable fast way to tell multiple files are true matches. Duplicate files will become hard links pointing to the same file. This feature is helpful for use cases where you do want to keep multiple representation of the same file in different directories but don't want to waste disk space or to periodically sync them.
- 12. **Remove-extras** *-R* will also only be performed with a **checksum-match,** even without calling *-c* to prevent unwanted data loss.
- 13. Although it is **theoretically possible** for two different files to have the same checksum. Those chances are astronomically low (about 1 in 2<sup>128</sup>). On top of that, when taking into account that the files assessed are at the same device, the same directory and have the same size, a false match becomes **practically impossible**. You can also add date-match and headtail-match to that equation for piece of mind, in which case a false match would be in a realm of conjectures. There is a confirmation prompt showing the results before actually deleting the files; ***PROCEED WITH CAUTION, you are responsible for the data you mess with. It is advised to test the behavior of this operation in a safe environment before going into action!***.
- 14. You can use Remove-extras directly in the target directory without any operation before. But **it is good practice to run Remove-extra in the target/DUPLICATES subdirectory after performing a Move-all operation in the target directory**, assessing manually what went there. This way, the delete action will be contained into just what you have already delimited.
- 15. **Do  not use this tool with any file operation on directories with system data, it might break your system. This tool was design to manage user data, not system data. It is meant for files that can be renamed, moved or removed.**
+ 11. **Copy-uniques** *-C* operation will not copy 0 byte files, since all empty data are virtually duplicates (0=0). It will not copy symbolic links, either. This tool is designed only for files with *-type f* and ≥ 1 byte. Files will be copied using the same directory structure from the reference. If there is a file with the same name at the target directory, the reference copy will have a timestamp suffix. If **Maximum search depth** *-d #* is specified, it will apply the same depth rule for both target and reference directories.
+ 12. **Hardlink-extras** *-H* will only be performed with a **checksum-match,** no matter if the user did not explicitly specify *-c*. This behavior is arbitrary set to prevent unwanted data loss, since checksum-match is currently the most reliable fast way to tell multiple files are true matches. Duplicate files will become hard links pointing to the same file. This feature is helpful for use cases where you do want to keep multiple representation of the same file in different directories but don't want to waste disk space or to periodically sync them.
+ 13. **Remove-extras** *-R* will also only be performed with a **checksum-match,** even without calling *-c* to prevent unwanted data loss. The safest way is to perform this operation at the DUPLICATES directory after a Move-all operation and assessing what was moved there. Although it is still possible to perform it directly in the target directory. A confirmation and a report with all files to be removed will appear before the action is completed.
+ 14. Although it is **theoretically possible** for two different files to have the same checksum. Those chances are astronomically low (about 1 in 2<sup>128</sup>). On top of that, when taking into account that the files assessed are at the same device, the same directory and have the same size, a false match becomes **practically impossible**. You can also add date-match and headtail-match to that equation for piece of mind, in which case a false match would be in a realm of conjectures. There is a confirmation prompt showing the results before actually deleting the files; ***PROCEED WITH CAUTION, you are responsible for the data you mess with. It is advised to test the behavior of this operation in a safe environment before going into action!***.
+ 15. You can use Remove-extras directly in the target directory without any operation before. But **it is good practice to run Remove-extra in the target/DUPLICATES subdirectory after performing a Move-all operation in the target directory**, assessing manually what went there. This way, the delete action will be contained into just what you have already delimited.
+ 16. **Do  not use this tool with any file operation on directories with system data, it might break your system. This experimental tool is designed to manage user data, not system data. It is meant for files that can be renamed, moved or removed. Test it and read the reports before confirming any file operations. It is also good practice to back up your data before removing anything. The code is not long, you can always inspect it to see what is going on.**

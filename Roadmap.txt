@@ -1,2 +1,0 @@
-Road map:
-v1.0 Add Merge directories as file operation (copy non duplicates from reference directory).
