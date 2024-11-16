@@ -3,8 +3,8 @@
 # Author: Amauri Casarin Junior
 # Purpose: Batch search and processing duplicate files.
 # License: GPL-3.0 license
-# Version: 1.0
-# Date: November 14, 2024
+# Version: 1.1
+# Date: November 16, 2024
 
 usage_message="Usage: $0 [-options] target_directory
 
@@ -51,6 +51,7 @@ RECURSIVE_SEARCH=1
 DEPTH_SEARCH=0
 # MATCH FLAGS
 NAME_MATCH=false
+EXTENSION_MATCH=false
 SIZE_MATCH=true
 INODE_MATCH=false
 TIME_MATCH=false
@@ -71,7 +72,7 @@ verbosity=1 # 0 quiet, 1 normal and 2 verbose.
 #INPUT CHECKS
 #--------------------------------------------------------------------------------------
 # Process options using getopts
-while getopts ":rd:qmvnstihcLSMBHRC:" opt; do
+while getopts ":rd:qmvnestihcLSMBHRC:" opt; do
     case "$opt" in
         r) RECURSIVE_SEARCH=1;;
 
@@ -92,6 +93,8 @@ while getopts ":rd:qmvnstihcLSMBHRC:" opt; do
 
 
         n) NAME_MATCH=true;;
+
+        e) EXTENSION_MATCH=true;;
 
         s) SIZE_MATCH=true;;
 
@@ -202,7 +205,7 @@ log() {
 #--------------------------------------------------------------------------------------
 # Structure of the data for analisys
 header=''
-fields=("Size" "Time" "Headtail" "Checksum" "Inode" "Name" "Path")
+fields=("Size" "Headtail" "Checksum" "Time" "Inode" "Name" "Extension" "Path")
 
 # Create index arrays for columns and tabs names
 declare -A columns_index
@@ -220,17 +223,34 @@ done
 
 header="$(echo -e "$header")"
 
+split_extensions() {
+  ASSESSED_FILES=$1
+  # Processing the names of files and splitting their extensions using awk
+  data_update=$(awk -F'\t' -v OFS='\t' -v name="${columns_index["Name"]}" -v ext="${columns_index["Extension"]}" '{
+    match($name, /^(.*)\.([^.]*)$/, arr)
+    basename = (arr[1] != "") ? arr[1] : $name
+    extension = (arr[2] != "") ? toupper(arr[2]) : "-"  # Convert extension to uppercase
+
+    $name = basename
+    $ext = extension
+    print
+  }' <<< "$ASSESSED_FILES")
+  ASSESSED_FILES=$data_update
+}
+
+
 search_files() {
     local directory=$1
 
     log status -n "Searching files in $directory... "
     # Find metadata for all files inside the directory
-    print_format="%s\t%T+\t-\t-\t%i\t%f\t%p\n" # "-" for reserved non metadata fields
+    print_format="%s\t-\t-\t%T+\t%i\t%f\t-\t%p\n" # "-" for reserved non "find" fields
     if [ "$DEPTH_SEARCH" = 1 ]; then
         ASSESSED_FILES="$(find "$directory" -maxdepth "$max_depth" -type f -size +0c -printf "$print_format")"
     else
         ASSESSED_FILES="$(find "$directory" -type f -size +0c -printf "$print_format")"
     fi
+    split_extensions "$ASSESSED_FILES"
     total_assessed="$(echo "$ASSESSED_FILES" | grep -c -v '^$')"
     log status "ok"
     log status -e "Files found: $total_assessed\n"
@@ -344,6 +364,13 @@ find_matches() {
     fi
     match_columns=() # restart with empity match_columns after assessing inodes
 
+    if [ "$SIZE_MATCH" = true ];then
+        match_name="Size"
+        match_columns+=(${columns_index[$match_name]})
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES #update
+    fi
+
     if [ "$NAME_MATCH" = true ];then
         match_name="Name"
         match_columns+=(${columns_index[$match_name]})
@@ -351,8 +378,8 @@ find_matches() {
         ASSESSED_FILES=$DUPLICATES #update
     fi
 
-    if [ "$SIZE_MATCH" = true ];then
-        match_name="Size"
+    if [ "$EXTENSION_MATCH" = true ];then
+        match_name="Extension"
         match_columns+=(${columns_index[$match_name]})
         get_duplicates "$ASSESSED_FILES" "$match_name"
         ASSESSED_FILES=$DUPLICATES #update
@@ -373,13 +400,16 @@ find_matches() {
 
         local data_update=''
         counter=0
-        while IFS=$'\t' read -r size date headtail checksum inode name path; do
+        while IFS=$'\t' read -r -a tabs; do
             counter=$((counter + 1))
             printf "\rGetting headtail-data... %d/%d " "$counter" "$total_duplicates"
+            path="${tabs[${tabs_index["Path"]}]}"
             HEAD="$(head -c $headtail_length "$path" | xxd -p)"
             TAIL="$(tail -c $headtail_length "$path" | xxd -p)"
             headtail="${HEAD}${TAIL}"
-            data_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the headtail data
+            tabs[${tabs_index[$match_name]}]="$headtail"   # Update the headtail value in the tabs array
+            data_update+="$(IFS=$'\t'; printf "${tabs[*]}")\n" # Reconstruct the line with update
+
         done <<< "$ASSESSED_FILES"
         echo -e "ok"
         ASSESSED_FILES="$(echo -e "$data_update")"
@@ -387,24 +417,27 @@ find_matches() {
         ASSESSED_FILES=$DUPLICATES #update
     fi
 
-    # CHECKSUM-DATA MATCH
-    if [ "$CHECKSUM_MATCH" = true ];then
+        # CHECKSUM-DATA MATCH
+    if [ "$CHECKSUM_MATCH" = true ]; then
         match_name="Checksum"
         match_columns+=(${columns_index[$match_name]})
 
         data_update=''
         counter=0
-        while IFS=$'\t' read -r size date headtail checksum inode name path; do
+        while IFS=$'\t' read -r -a tabs; do
             counter=$((counter + 1))
             printf "\rGetting checksum data... %d/%d " "$counter" "$total_duplicates"
-            checksum=$(md5sum "$path"| cut -f 1  -d " ")
-            data_update+="$size\t$date\t$headtail\t$checksum\t$inode\t$name\t$path\n" #update with the checksum data
+            path="${tabs[${tabs_index["Path"]}]}"
+            checksum=$(md5sum "$path" | cut -f 1 -d " ") # Calculate the new checksum
+            tabs[${tabs_index[$match_name]}]="$checksum"   # Update the checksum value in the tabs array
+            data_update+="$(IFS=$'\t'; printf "${tabs[*]}")\n" # Reconstruct the line with update
         done <<< "$ASSESSED_FILES"
         echo -e "ok"
         ASSESSED_FILES="$(echo -e "$data_update")"
         get_duplicates "$ASSESSED_FILES" "$match_name"
-        ASSESSED_FILES=$DUPLICATES #update
+        ASSESSED_FILES=$DUPLICATES # Update
     fi
+
     DUPLICATES=$ASSESSED_FILES
 }
 
@@ -412,7 +445,7 @@ find_extras() {
     DUPLICATES=$1
     get_uniques "$DUPLICATES"
     MASTER_DUPLICATES="$UNIQUES"
-    EXTRA_DUPLICATES="$(echo "$DUPLICATES" | grep -v -x "$MASTER_DUPLICATES")"
+    EXTRA_DUPLICATES="$(echo "$DUPLICATES" | grep -F -v -x "$MASTER_DUPLICATES")"
 }
 
 find2d_uniques() {
@@ -422,15 +455,16 @@ find2d_uniques() {
     REFERENCE_FILES_path=$(awk -F'\t' '{print $NF}' <<< "$REFERENCE_FILES")
 
     # Split the duplicates
-    REFERENCE_DUPLICATES=$(grep "$REFERENCE_FILES_path"  <<< "$MERGED_DUPLICATES")
-    TARGET_DUPLICATES=$(grep -v -x "$REFERENCE_DUPLICATES" <<< "$MERGED_DUPLICATES")
+    REFERENCE_DUPLICATES=$(grep -F "$REFERENCE_FILES_path"  <<< "$MERGED_DUPLICATES")
+    TARGET_DUPLICATES=$(grep -F -v -x "$REFERENCE_DUPLICATES" <<< "$MERGED_DUPLICATES")
     # remerger but with the target on top so it takes precedence in the get_uniques function
-    remerged_duplicates="$(echo -e "$TARGET_FILES\n$REFERENCE_FILES")"
+    remerged_duplicates="$(echo -e "$TARGET_DUPLICATES\n$REFERENCE_DUPLICATES")"
+
     get_uniques "$remerged_duplicates"
     MASTER_DUPLICATES=$UNIQUES
-    REFERENCE_EXTRAS=$(grep -v -x "$MASTER_DUPLICATES" <<< "$REFERENCE_DUPLICATES") # files not to be copied
+    REFERENCE_EXTRAS=$(grep -F -v -x "$MASTER_DUPLICATES" <<< "$REFERENCE_DUPLICATES") # files not to be copied
     REFERENCE_EXTRAS_path=$(awk -F'\t' '{print $NF}' <<< "$REFERENCE_EXTRAS")
-    REFERENCE_UNIQUES_path=$(grep -v -x "$REFERENCE_EXTRAS_path" <<< "$REFERENCE_FILES_path") # files to be copied
+    REFERENCE_UNIQUES_path=$(grep -F -v -x "$REFERENCE_EXTRAS_path" <<< "$REFERENCE_FILES_path") # files to be copied
 }
 
 #--------------------------------------------------------------------------------------
@@ -508,18 +542,18 @@ move_all() {
 }
 
 list_copies() {
-    REFERENCE_UNIQUES_path=$1
-    REFERENCE_EXTRAS_path=$2
+    REFERENCE_UNIQUES_path="$(echo "$1" | sort -n)"
+    REFERENCE_EXTRAS_path="$(echo "$2" | sort -n)"
     total_copy="$(echo "$REFERENCE_UNIQUES_path" | grep -c -v '^$')"
     total_leave="$(echo "$REFERENCE_EXTRAS_path" | grep -c -v '^$')"
 
-    log status -e "Duplicate files from reference not to be copied:"
+    log status -e "\nDuplicate files from reference not to be copied:"
     log final -E "$REFERENCE_EXTRAS_path"
-    log status -e "Total: $total_leave\n"
+    log status -e "Total: $total_leave"
 
     log status -e "\nUnique files from reference to be copied:"
     log final -E "$REFERENCE_UNIQUES_path"
-    log status -e "Total: $total_copy\n"
+    log status -e "Total: $total_copy"
 
     duplicates_report="$TARGET_DIR/CDreport_duplicates.txt"
     echo "$header" > "$duplicates_report"
@@ -533,14 +567,14 @@ list_copies() {
     else
         copy_report="$TARGET_DIR/CDreport_copy.txt"
         echo "$REFERENCE_UNIQUES_path" > "$copy_report"
-        log status -e "\nUnique files report saved to $copy_report"
+        log status -e "Unique files report saved to $copy_report"
     fi
 
 }
 
 copy_uniques() {
     REFERENCE_UNIQUES_path=$1
-    log status -en "\nCoping files..."
+    log status -en "\nCoping files... "
     copied_report="$TARGET_DIR/CDreport_copied_files.txt"
     noncopied_report="$TARGET_DIR/CDreport_noncopied_files.txt"
     echo -n "" > "$copied_report"
@@ -549,7 +583,6 @@ copy_uniques() {
         relative_path=$(realpath --relative-to="$REFERENCE_DIR" "$path")
         new_path="${TARGET_DIR}/$relative_path"
         dir_path="$(dirname "$new_path")"
-        echo "$dir_path"
         mkdir -p "$dir_path"
         cp --update=none "$path" "$new_path" || cp "$path" "$dir_path/$(basename "${path%.*}")_$(date +%s).${path##*.}"
 
@@ -565,7 +598,7 @@ copy_uniques() {
 
 
 list_moved() {
-    MOVED_FILES=$1
+    MOVED_FILES="$(echo "$1" | sort -n)"
     log status -e "Files found to be moved back:"
     log final -E "$MOVED_FILES"
     log status -e "Total: $total_found\n"
@@ -593,8 +626,8 @@ move_back () {
 }
 
 list_extras() {
-    MASTER_DUPLICATES=$1
-    EXTRA_DUPLICATES=$2
+    MASTER_DUPLICATES="$(echo "$1" | sort -n)"
+    EXTRA_DUPLICATES="$(echo "$2" | sort -n)"
     total_keep="$(echo "$MASTER_DUPLICATES" | grep -c -v '^$')"
     total_remove="$(echo "$EXTRA_DUPLICATES" | grep -c -v '^$')"
 
@@ -624,7 +657,7 @@ hardlink_extras() {
     while IFS=$'\t' read -r -a tabs; do
         checksum="${tabs[${tabs_index["Checksum"]}]}"
         link_path="${tabs[${tabs_index["Path"]}]}"
-        master_path="$(echo "$MASTER_DUPLICATES" | grep $'\t'"$checksum"$'\t' | awk -F'\t' '{print $NF}')"
+        master_path="$(echo "$MASTER_DUPLICATES" | grep -F $'\t'"$checksum"$'\t' | awk -F'\t' '{print $NF}')"
         ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
         report_line="Replaced $link_path by a link to $master_path"
         log partial "$report_line"
@@ -636,7 +669,7 @@ hardlink_extras() {
 
 remove_extras() {
     EXTRA_DUPLICATES=$1
-    log status  -e "\nRemoving extra duplicates..."
+    log status  -en "\nRemoving extra duplicates... "
     removed_files="$TARGET_DIR/CDreport_removed_files.txt"
     echo -n "" > "$removed_files"
     while IFS=$'\t' read -r -a tabs; do
