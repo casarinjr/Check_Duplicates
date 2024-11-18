@@ -3,8 +3,8 @@
 # Author: Amauri Casarin Junior
 # Purpose: Batch search and processing duplicate files.
 # License: GPL-3.0 license
-# Version: 1.1
-# Date: November 16, 2024
+# Version: 1.2
+# Date: November 18, 2024.
 
 usage_message="Usage: $0 [-options] target_directory
 
@@ -19,7 +19,8 @@ Options:
         [-s] Perform a metadata match by size in bytes. (default)
         [-t] Perform a metadata match by last modified time.
         [-h] Perform a data match by 10 bytes in head and tail.
-        [-c] Perform a data match by md5 checksum.
+        [-c] Perform a data match by CRC-32 checksum.
+        [-m] Perform a data match by MD5 checksum.
 
         File operations (one):
         [-L] List all duplicate files found. (default)
@@ -32,7 +33,7 @@ Options:
 
         Output verbosity:
         [-q] Quiet: echo only status and operational messages. (0 precedence)
-        [-m] Moderate: echo final results additionally. (1 precedence) (default)
+        [-b] Balanced: echo final results additionally. (1 precedence) (default)
         [-v] Verbose: echo partial results additionally and creates a log file. (2 precedence)
 
 
@@ -56,7 +57,8 @@ SIZE_MATCH=true
 INODE_MATCH=false
 TIME_MATCH=false
 HEADTAIL_MATCH=false
-CHECKSUM_MATCH=false
+CRC32_MATCH=false
+MD5_MATCH=false
 # FILE FLAGS
 LIST_ALL=1
 SOFTLINK_ALL=0
@@ -72,7 +74,7 @@ verbosity=1 # 0 quiet, 1 normal and 2 verbose.
 #INPUT CHECKS
 #--------------------------------------------------------------------------------------
 # Process options using getopts
-while getopts ":rd:qmvnestihcLSMBHRC:" opt; do
+while getopts ":rd:qmvnestihcmLSMBHRC:" opt; do
     case "$opt" in
         r) RECURSIVE_SEARCH=1;;
 
@@ -87,7 +89,7 @@ while getopts ":rd:qmvnestihcLSMBHRC:" opt; do
 
         q) verbosity=0;;
 
-        m) verbosity=1;;
+        b) verbosity=1;;
 
         v) verbosity=2 ;;
 
@@ -104,7 +106,9 @@ while getopts ":rd:qmvnestihcLSMBHRC:" opt; do
 
         h) HEADTAIL_MATCH=true; headtail_length=10;;
 
-        c) CHECKSUM_MATCH=true;;
+        c) CRC32_MATCH=true;;
+
+        m) MD5_MATCH=true;;
 
 
         L) LIST_ALL=1; operation_name="list";;
@@ -115,11 +119,11 @@ while getopts ":rd:qmvnestihcLSMBHRC:" opt; do
 
         B) MOVE_BACK=1; operation_name="move back"; LIST_ALL=0;;
 
-        H) HARDLINK_EXTRAS=1; operation_name="hard link"; LIST_ALL=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
+        H) HARDLINK_EXTRAS=1; operation_name="hard link"; LIST_ALL=0; CRC32_MATCH=true;; # for safety, only allows deletion with checksum match.
 
-        R) REMOVE_EXTRAS=1; operation_name="remove"; LIST_ALL=0; CHECKSUM_MATCH=true;; # for safety, only allows deletion with checksum match.
+        R) REMOVE_EXTRAS=1; operation_name="remove"; LIST_ALL=0; CRC32_MATCH=true;; # for safety, only allows deletion with checksum match.
 
-        C) COPY_UNIQUES=1; operation_name="copy"; LIST_ALL=0; CHECKSUM_MATCH=true;
+        C) COPY_UNIQUES=1; operation_name="copy"; LIST_ALL=0; CRC32_MATCH=true;
             if [[ -d "$OPTARG" ]]; then
                 REFERENCE_DIR="$OPTARG"
                 echo "Reference directory provided: $REFERENCE_DIR"
@@ -205,7 +209,7 @@ log() {
 #--------------------------------------------------------------------------------------
 # Structure of the data for analisys
 header=''
-fields=("Size" "Headtail" "Checksum" "Time" "Inode" "Name" "Extension" "Path")
+fields=("Size" "Headtail" "Crc32" "Md5" "Time" "Inode" "Name" "Extension" "Path")
 
 # Create index arrays for columns and tabs names
 declare -A columns_index
@@ -244,7 +248,7 @@ search_files() {
 
     log status -n "Searching files in $directory... "
     # Find metadata for all files inside the directory
-    print_format="%s\t-\t-\t%T+\t%i\t%f\t-\t%p\n" # "-" for reserved non "find" fields
+    print_format="%s\t-\t-\t-\t%T+\t%i\t%f\t-\t%p\n" # "-" for reserved non "find" fields
     if [ "$DEPTH_SEARCH" = 1 ]; then
         ASSESSED_FILES="$(find "$directory" -maxdepth "$max_depth" -type f -size +0c -printf "$print_format")"
     else
@@ -393,7 +397,6 @@ find_matches() {
     fi
 
 
-    # HEADTAIL-DATA MATCH
     if [ "$HEADTAIL_MATCH" = true ];then
         match_name="Headtail"
         match_columns+=(${columns_index[$match_name]})
@@ -417,16 +420,35 @@ find_matches() {
         ASSESSED_FILES=$DUPLICATES #update
     fi
 
-        # CHECKSUM-DATA MATCH
-    if [ "$CHECKSUM_MATCH" = true ]; then
-        match_name="Checksum"
+    if [ "$CRC32_MATCH" = true ]; then
+        match_name="Crc32"
         match_columns+=(${columns_index[$match_name]})
 
         data_update=''
         counter=0
         while IFS=$'\t' read -r -a tabs; do
             counter=$((counter + 1))
-            printf "\rGetting checksum data... %d/%d " "$counter" "$total_duplicates"
+            printf "\rGetting crc32 data... %d/%d " "$counter" "$total_duplicates"
+            path="${tabs[${tabs_index["Path"]}]}"
+            checksum=$(cksum "$path" | cut -f 1 -d " ") # Calculate the new checksum
+            tabs[${tabs_index[$match_name]}]="$checksum"   # Update the checksum value in the tabs array
+            data_update+="$(IFS=$'\t'; printf "${tabs[*]}")\n" # Reconstruct the line with update
+        done <<< "$ASSESSED_FILES"
+        echo -e "ok"
+        ASSESSED_FILES="$(echo -e "$data_update")"
+        get_duplicates "$ASSESSED_FILES" "$match_name"
+        ASSESSED_FILES=$DUPLICATES # Update
+    fi
+
+     if [ "$MD5_MATCH" = true ]; then
+        match_name="Md5"
+        match_columns+=(${columns_index[$match_name]})
+
+        data_update=''
+        counter=0
+        while IFS=$'\t' read -r -a tabs; do
+            counter=$((counter + 1))
+            printf "\rGetting md5 data... %d/%d " "$counter" "$total_duplicates"
             path="${tabs[${tabs_index["Path"]}]}"
             checksum=$(md5sum "$path" | cut -f 1 -d " ") # Calculate the new checksum
             tabs[${tabs_index[$match_name]}]="$checksum"   # Update the checksum value in the tabs array
@@ -649,16 +671,25 @@ list_extras() {
     log status -e "Extra duplicates report saved to $extra_duplicates_file"
 }
 
-hardlink_extras() {
+hardlink_extras0() {
     EXTRA_DUPLICATES=$1
     log status  -en "\nReplacing extra duplicates by hard links..."
     hardlinked_files="$TARGET_DIR/CDreport_hardlinked_files.txt"
     echo -n "" > "$hardlinked_files"
     while IFS=$'\t' read -r -a tabs; do
-        checksum="${tabs[${tabs_index["Checksum"]}]}"
         link_path="${tabs[${tabs_index["Path"]}]}"
-        master_path="$(echo "$MASTER_DUPLICATES" | grep -F $'\t'"$checksum"$'\t' | awk -F'\t' '{print $NF}')"
-        ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
+
+
+        match_fields="$(echo "${tabs[*]:0:4}" | tr ' ' $'\t')"
+        echo "oi"
+        echo "$match_fields"
+
+        master_path="$(echo "$MASTER_DUPLICATES" | grep -F "$match_fields" | awk -F'\t' '{print $NF}')"
+        echo "$master_path"
+
+
+
+        #ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
         report_line="Replaced $link_path by a link to $master_path"
         log partial "$report_line"
         echo "$report_line" >> "$hardlinked_files"
@@ -666,6 +697,50 @@ hardlink_extras() {
     log status "ok"
     log status -e "\nHard linked files report saved to $hardlinked_files"
 }
+
+
+hardlink_extras() {
+    EXTRA_DUPLICATES=$1
+    master_columns=(1 3 4 2)  # Define the columns to be matched
+    log status -en "\nReplacing extra duplicates by hard links..."
+    hardlinked_files="$TARGET_DIR/CDreport_hardlinked_files.txt"
+    echo -n "" > "$hardlinked_files"
+
+    while IFS=$'\t' read -r -a extras; do
+        link_path="${extras[${tabs_index["Path"]}]}"
+
+        # Use awk to find the matching master path with debug prints
+        master_path=$(echo "$MASTER_DUPLICATES" | awk -F'\t' -v OFS='\t' -v masters="${master_columns[*]}" -v extras="${extras[*]}" '
+        BEGIN {
+            split(masters, master_arr, " ");
+            split(extras, extra_arr, " ");
+            match_fields = extra_arr[master_arr[1]];
+            for (i = 2; i <= length(master_arr); i++) {
+                match_fields = match_fields OFS extra_arr[master_arr[i]];
+            }}
+        {
+            master_match_fields = $master_arr[1];
+            for (i = 2; i <= length(master_arr); i++) {
+                master_match_fields = master_match_fields OFS $master_arr[i];
+            }
+            if (match_fields == master_match_fields) {
+                print $NF; exit;
+            }}')
+
+        ln -Tf "$master_path" "$link_path" # forcing (-f) the link to replace the duplicates
+        report_line="Replaced $link_path by a link to $master_path"
+        log partial "$report_line"
+        echo "$report_line" >> "$hardlinked_files"
+    done <<< "$EXTRA_DUPLICATES"
+
+    log status "ok"
+    log status -e "\nHard linked files report saved to $hardlinked_files"
+}
+
+
+
+
+
 
 remove_extras() {
     EXTRA_DUPLICATES=$1
@@ -736,5 +811,3 @@ elif [ "$COPY_UNIQUES" = 1 ]; then
     exit
 fi
 #--------------------------------------------------------------------------------------
-
-
